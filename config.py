@@ -2,7 +2,7 @@
 
 import re
 
-DATA_FILE_PATH = "C:/Users/aleca/Desktop/DE_Analysis/Disco Elysium.json" 
+DATA_FILE_PATH = "Disco Elysium.json" # file name as per extraction, to change if needed
 
 # 24 skills who act as the voices in the protagonist's head + 3 extra voices who take the word in dream sequences but are not skills from a mechanical point of view
 # used when creating Gephi graphs, allows to distinguish "internal" dialogue nodes.
