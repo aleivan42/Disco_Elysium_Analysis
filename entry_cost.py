@@ -68,41 +68,9 @@ def reputation_grows_counts(data: dict) -> pd.DataFrame:
     return df
 
 
-def threshold_checks(data: dict) -> dict[str, list[tuple[int, int, str, int]]]:
-    print("\n" + "="*70)
-    print("NUMERICAL THRESHOLD CHECKS ON REPUTATION COUNTERS:")
-    print("="*70)
-
-    results = {}
-    for ideology, variable_name in IDEOLOGY_REPUTATION_VARS.items():
-        hits = []
-        for conv in data.get("conversations", []):
-            conv_id = conv["id"]
-            for entry in conv.get("dialogueEntries", []):
-                cond = entry.get("conditionsString", "") or ""
-                for var, op, value in CHECK_VAR_THRESHOLD_RE.findall(cond):
-                    if var == variable_name:
-                        hits.append((conv_id, entry["id"], op, int(value)))
-        
-        results[ideology] = hits
-        print(f" -> {ideology:<15} ({variable_name}): {len(hits)} threshold check(s) found.")
-        for conv_id, entry_id, op, value in hits:
-            print(f"    [Conv {conv_id:<4} | Entry {entry_id:<5}] Condition: {variable_name} {op} {value}")
-
-    print("="*70)
-    return results
-
-
-
-def run_entry_cost_analysis(data: dict):
-    """Executes the full Step 2 analysis pipeline."""
-    df_distribution = reputation_grows_counts(data)
-    threshold_checks(data)
-
-
 if __name__ == "__main__":
     print(f"Loading dialogue data from {DATA_FILE_PATH}...")
     with open(DATA_FILE_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
     
-    run_entry_cost_analysis(data)
+    reputation_grows_counts(data)
