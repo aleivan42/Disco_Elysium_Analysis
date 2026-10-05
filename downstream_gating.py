@@ -1,5 +1,6 @@
+from multiprocessing.spawn import prepare
 import re
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import networkx as nx
 
@@ -8,7 +9,6 @@ from config import (
     FINISH_TASK_RE,
     GAIN_TASK_RE,
     CHECK_VAR_THRESHOLD_RE,
-    REPUTATION_GROWS_RE,
     ISTHC_PRESENT_RE,
 )
 from data_loading import load_game_data
@@ -32,14 +32,6 @@ SET_VAR_ASSIGN_RE = re.compile(
 IS_TASK_ACTIVE_RE = re.compile(r'IsTaskActive\(\s*["\']([^"\']+)["\']\s*\)')
 QUEST_SIGNATURE_FIELDS = {"display_condition_main", "done_condition_main", "task_reward"}
 SETTER_ACTIONS = {"set_true", "set_false", "gain_task", "finish_task"}
-
-
-# ---------------------------------------------------------------------------
-# 0. Quest object + chain tracing (invariato rispetto allo script di
-#    Internal Breadth -- stessa fonte di verità per target_vars e
-#    internal_conv_ids, cosi' il downstream gating e' misurato esattamente
-#    sullo stesso sottografo gia' riportato in Tabella 4.2)
-# ---------------------------------------------------------------------------
 
 
 def find_quest_entry(data: dict, quest_id: int):
@@ -99,14 +91,12 @@ def all_target_variables(quest_structure: dict) -> set:
 
 
 def bare_task_name(var_name):
-    """'TASK.get_yourself_organised' -> 'get_yourself_organised'."""
     if var_name and var_name.startswith("TASK."):
         return var_name.split(".", 1)[1]
     return var_name
 
 
 def trace_chain_and_downstream(data: dict, seed_task_var: str):
-    """Identica alla versione usata per l'Internal Breadth (Tabella 4.2)."""
     chain = {bare_task_name(seed_task_var)}
     changed = True
 
@@ -234,38 +224,18 @@ def build_internal_subgraph(data: dict, internal_conv_ids: set) -> nx.DiGraph:
     return master
 
 
-# ---------------------------------------------------------------------------
-# 1. Downstream gating: classificazione dei punti di attrito
-#
-#    Un nodo del sottografo interno e' un "gate" se la sua conditionsString
-#    referenzia stato che NON fa parte delle variabili proprie della quest
-#    (target_vars): quelle sono semplice bookkeeping interno (gia' contate
-#    in Internal Breadth), non un ostacolo imposto al giocatore. Le
-#    categorie NON sono mutuamente esclusive: un nodo con una condizione
-#    composta (es. task dependency AND thought gate) viene taggato in
-#    entrambe.
-#
-#    Distinzione REAL_GATE_TAGS vs NARRATIVE_STATE_TAGS: ispezionando le
-#    variabili effettivamente catturate, "stat_or_skill_threshold" e
-#    "other_external_condition" risultano quasi interamente contatori
-#    narrativi e flag di variante cosmetica (meteo, saluti gia' dati,
-#    quante volte hai chiesto una cosa), non vera frizione strutturale.
-#    Solo external_task_dependency, reputation_gate e thought_gate
-#    rappresentano barriere che condizionano l'accesso a contenuto, non
-#    solo la sua variazione superficiale.
-# ---------------------------------------------------------------------------
-
 REAL_GATE_TAGS = {"external_task_dependency", "reputation_gate", "thought_gate"}
-NARRATIVE_STATE_TAGS = {"stat_or_skill_threshold", "other_external_condition"}
+NARRATIVE_STATE_TAGS = {"scene_done_flag", "internal_counter", "other_external_condition"}
+
+POLITICAL_THOUGHTS = {
+    "Communism": "communist",
+    "Fascism": "revacholian_nationhood",
+    "Ultraliberalism": "ultraliberal",
+    "Moralism": "moralist",
+}
 
 
 def classify_gate_node(cond: str, target_vars_bare: set):
-    """Ritorna un set di categorie di gate rilevate in questa conditionsString,
-
-    piu' i nomi di variabile/task coinvolti per categoria (per audit
-    manuale). Nulla viene ritornato per condizioni vuote o che
-    referenziano solo variabili proprie della quest.
-    """
     tags = set()
     involved = defaultdict(set)
 
@@ -274,166 +244,207 @@ def classify_gate_node(cond: str, target_vars_bare: set):
             tags.add("external_task_dependency")
             involved["external_task_dependency"].add(name)
 
-    for var_name in VAR_REF_RE.findall(cond):
-        if var_name.endswith("_done"):
-            base = bare_task_name(var_name[: -len("_done")])
-            if base not in target_vars_bare:
-                tags.add("external_task_dependency")
-                involved["external_task_dependency"].add(var_name)
+    thresholds = CHECK_VAR_THRESHOLD_RE.findall(cond)
+    threshold_vars = {v for v, _, _ in thresholds}
 
-    for var_name, _op, _num in CHECK_VAR_THRESHOLD_RE.findall(cond):
+    for var_name, _op, _num in thresholds:
         if bare_task_name(var_name) in target_vars_bare:
             continue
-        if var_name.startswith("reputation."):
-            tags.add("reputation_gate")
-            involved["reputation_gate"].add(var_name)
+        tag = "reputation_gate" if var_name.startswith("reputation.") else "internal_counter"
+        tags.add(tag)
+        involved[tag].add(var_name)
+
+    for var_name in VAR_REF_RE.findall(cond):
+        if var_name in threshold_vars or bare_task_name(var_name) in target_vars_bare:
+            continue
+        if var_name.startswith("TASK."):
+            base = bare_task_name(var_name[:-len("_done")] if var_name.endswith("_done") else var_name)
+            if base in target_vars_bare:
+                continue
+            tag = "external_task_dependency"
+        elif var_name.endswith("_done"):
+            tag = "scene_done_flag"          
         else:
-            tags.add("stat_or_skill_threshold")
-            involved["stat_or_skill_threshold"].add(var_name)
+            tag = "other_external_condition"
+        tags.add(tag)
+        involved[tag].add(var_name)
 
     for var_name in ISTHC_PRESENT_RE.findall(cond):
         tags.add("thought_gate")
         involved["thought_gate"].add(var_name)
 
-    # Variabili booleane esterne referenziate ma non gia' coperte sopra
-    # (es. flag di mondo, esiti di altre quest, stato di un NPC).
-    threshold_vars = {v for v, _, _ in CHECK_VAR_THRESHOLD_RE.findall(cond)}
-    for var_name in VAR_REF_RE.findall(cond):
-        if var_name.endswith("_done") or var_name in threshold_vars:
-            continue
-        if bare_task_name(var_name) in target_vars_bare:
-            continue
-        tags.add("other_external_condition")
-        involved["other_external_condition"].add(var_name)
-
     return tags, involved
 
 
-def compute_downstream_gating(master: nx.DiGraph, target_vars_bare: set):
-    tag_counts = defaultdict(int)
-    variables_by_tag = defaultdict(set)
-    nodes_by_tag = defaultdict(set)
-    any_tagged_nodes = set()
+def compute_downstream_gating(master, target_vars_bare, foreign_tasks=frozenset(),
+                              foreign_thoughts=frozenset()):
+    real_nodes = {n for n, d in master.nodes(data=True) if "kind" in d}
+    ghost_nodes = master.number_of_nodes() - len(real_nodes)
 
-    for node, attrs in master.nodes(data=True):
-        cond = attrs.get("conditions", "")
+    nodes_by_tag = defaultdict(set)
+    variables_by_tag = defaultdict(set)
+    cross_nodes, any_tagged = set(), set()
+
+    for node in real_nodes:
+        cond = master.nodes[node].get("conditions", "")
         if not cond:
             continue
         tags, involved = classify_gate_node(cond, target_vars_bare)
         if tags:
-            any_tagged_nodes.add(node)
+            any_tagged.add(node)
         for tag in tags:
-            tag_counts[tag] += 1
-            variables_by_tag[tag] |= involved[tag]
             nodes_by_tag[tag].add(node)
+            variables_by_tag[tag] |= involved[tag]
+        for v in involved["external_task_dependency"]:
+            base = bare_task_name(v[:-len("_done")] if v.endswith("_done") else v)
+            if base in foreign_tasks:
+                cross_nodes.add(node)
+        if involved["thought_gate"] & foreign_thoughts:
+            cross_nodes.add(node)
 
-    # Nodi deduplicati che portano ALMENO una vera barriera strutturale
-    # (task dependency incrociata, reputation gate, thought gate), a
-    # differenza di any_tagged_nodes che include anche il rumore
-    # narrativo/cosmetico di NARRATIVE_STATE_TAGS.
-    real_gate_nodes = set()
-    for tag in REAL_GATE_TAGS:
-        real_gate_nodes |= nodes_by_tag.get(tag, set())
-
-    narrative_state_nodes = set()
-    for tag in NARRATIVE_STATE_TAGS:
-        narrative_state_nodes |= nodes_by_tag.get(tag, set())
+    strict = set().union(*(nodes_by_tag[t] for t in REAL_GATE_TAGS))
+    medium = strict | nodes_by_tag["scene_done_flag"]
 
     return {
-        "total_gate_nodes": len(any_tagged_nodes),
-        "real_gate_nodes": len(real_gate_nodes),
-        "narrative_state_nodes": len(narrative_state_nodes),
-        "tag_counts": dict(tag_counts),
+        "total_nodes": len(real_nodes),
+        "ghost_nodes": ghost_nodes,
+        "strict_nodes": len(strict),        # task + reputation + Thought
+        "medium_nodes": len(medium),        # as above + flag *_done non-task
+        "broad_nodes": len(any_tagged),     # as above + any external reference
+        "cross_ideology_nodes": len(cross_nodes),
+        "tag_nodes": {t: len(n) for t, n in nodes_by_tag.items()},
         "variables_by_tag": {k: sorted(v) for k, v in variables_by_tag.items()},
     }
 
 
-# ---------------------------------------------------------------------------
-# 2. Pipeline principale: le 4 quest in un unico giro
-# ---------------------------------------------------------------------------
-
-
-def analyze_quest(data: dict, ideology: str, quest_id: int):
+def prepare_quest(data: dict, quest_id: int):
     _, quest_entry = find_quest_entry(data, quest_id)
     if quest_entry is None:
-        print(f"[errore] {ideology}: quest id={quest_id} non trovata.")
         return None
-
-    quest_structure = extract_quest_variables(quest_entry)
-    own_vars = all_target_variables(quest_structure)
-    seed_task_var = quest_structure["main"]["display"]
-
-    chain_vars = trace_chain_and_downstream(data, seed_task_var)
-    own_vars_bare = {bare_task_name(v) for v in own_vars}
+    structure = extract_quest_variables(quest_entry)
+    own_vars_bare = {bare_task_name(v) for v in all_target_variables(structure)}
+    chain_vars = trace_chain_and_downstream(data, structure["main"]["display"])
     target_vars = own_vars_bare | chain_vars
-
     events = find_variable_events(data, target_vars) + find_task_chain_events(data, target_vars)
-    internal_conv_ids, _reactivity_conv_ids = classify_conversations(events)
-
-    master = build_internal_subgraph(data, internal_conv_ids)
-    gating = compute_downstream_gating(master, target_vars)
-
-    total_nodes = master.number_of_nodes()
-    real_pct = 100 * gating["real_gate_nodes"] / total_nodes if total_nodes else 0.0
-
-    print(f"\n=== {ideology} (Quest {quest_id}) ===")
-    print(f"Conversazioni attraversate (internal_conv_ids): {sorted(internal_conv_ids)}")
-    print(f"Nodi totali nel sottografo                        : {total_nodes}")
-    print(f"Nodi con QUALSIASI riferimento esterno (con rumore): {gating['total_gate_nodes']}")
-    print(f"Nodi con narrative-state noise soltanto            : {gating['narrative_state_nodes']}")
-    print(f"Nodi con almeno una barriera STRUTTURALE REALE     : {gating['real_gate_nodes']} "
-          f"({real_pct:.1f}% dei nodi totali)")
-    for tag, count in sorted(gating["tag_counts"].items()):
-        kind = "REAL GATE" if tag in REAL_GATE_TAGS else "narrative state (escluso dal conteggio reale)"
-        print(f"  - {tag:<26}: {count} occorrenze [{kind}]")
-        print(f"      variabili coinvolte: {gating['variables_by_tag'][tag]}")
-
-    return {
-        "ideology": ideology,
-        "quest_id": quest_id,
-        "internal_conv_ids": sorted(internal_conv_ids),
-        "total_nodes": total_nodes,
-        "real_gate_pct": real_pct,
-        **gating,
-    }
+    internal_conv_ids, _ = classify_conversations(events)
+    return {"target_vars": target_vars,
+            "conv_ids": sorted(internal_conv_ids),
+            "master": build_internal_subgraph(data, internal_conv_ids)}
 
 
-def run_pipeline():
-    data = load_game_data(DATA_FILE_PATH)
+def skill_check_stats(data: dict, prepared: dict):
+    conv_by_id = {c["id"]: c for c in data["conversations"]}
+    fields_to_check = ("DifficultyPass", "DifficultyWhite", "DifficultyRed")
+
+    for ideology, p in prepared.items():
+        dist = {name: Counter() for name in fields_to_check}
+        n_entries = 0
+        for cid in p["conv_ids"]:
+            for e in conv_by_id[cid]["dialogueEntries"]:
+                n_entries += 1
+                f = {x["title"]: x["value"] for x in e.get("fields", [])}
+                for name in fields_to_check:
+                    if name in f:
+                        dist[name][str(f[name])] += 1
+
+        print(f"\n=== {ideology}: {n_entries} entries ===")
+        for name in fields_to_check:
+            total = sum(dist[name].values())
+            print(f"  {name}: {total} entries with the field")
+            print(f"    value distribution: {dict(sorted(dist[name].items()))}")
+        active = sum(dist["DifficultyWhite"].values()) + sum(dist["DifficultyRed"].values())
+        print(f"  active checks (White + Red): {active} "
+              f"({100 * active / n_entries:.2f}% of entries)" if n_entries else "")
+
+
+def run_pipeline(data):
+    prepared = {i: prepare_quest(data, qid) for i, qid in QUEST_IDS.items()}
+    prepared = {i: p for i, p in prepared.items() if p is not None}
+
     results = {}
-    for ideology, quest_id in QUEST_IDS.items():
-        results[ideology] = analyze_quest(data, ideology, quest_id)
+    for ideology, p in prepared.items():
+        foreign_tasks = set().union(
+            *(q["target_vars"] for i, q in prepared.items() if i != ideology)
+        ) - p["target_vars"]
+        foreign_thoughts = {t for i, t in POLITICAL_THOUGHTS.items() if i != ideology}
+        r = compute_downstream_gating(p["master"], p["target_vars"], foreign_tasks, foreign_thoughts)
+        r["conv_ids"] = p["conv_ids"]
+        results[ideology] = r
 
-    print("\n=== RIEPILOGO (per Tabella Downstream Gating) ===")
-    print(
-        "Ideology".ljust(18)
-        + "Total Nodes".ljust(14)
-        + "Real Gate Nodes".ljust(18)
-        + "Real Gate %".ljust(14)
-    )
+        print(f"\n=== {ideology} === convs {r['conv_ids']}")
+        for tag in sorted(REAL_GATE_TAGS):          # variable lists for the real gates only
+            print(f"  {tag}: {r['tag_nodes'].get(tag, 0)} nodes")
+            print(f"    {r['variables_by_tag'].get(tag, [])}")
+
+    pct = lambda n, t: f"{100 * n / t:.1f}%" if t else "-"
+    print("\n=== SUMMARY ===")
+    print("Ideology".ljust(17) + "Nodes".ljust(8) + "Ghost".ljust(7) + "Strict".ljust(14)
+          + "Medium".ljust(14) + "Broad".ljust(14) + "Cross-ideol.")
     for ideology, r in results.items():
-        if r is None:
-            continue
-        print(
-            ideology.ljust(18)
-            + str(r["total_nodes"]).ljust(14)
-            + str(r["real_gate_nodes"]).ljust(18)
-            + f"{r['real_gate_pct']:.1f}%".ljust(14)
-        )
+        t = r["total_nodes"]
+        print(ideology.ljust(17) + str(t).ljust(8) + str(r["ghost_nodes"]).ljust(7)
+              + f"{r['strict_nodes']} ({pct(r['strict_nodes'], t)})".ljust(14)
+              + f"{r['medium_nodes']} ({pct(r['medium_nodes'], t)})".ljust(14)
+              + f"{r['broad_nodes']} ({pct(r['broad_nodes'], t)})".ljust(14)
+              + str(r["cross_ideology_nodes"]))
 
-    print("\n(per categoria, occorrenze grezze non deduplicate -- solo per riferimento)")
-    all_tags = sorted({tag for r in results.values() if r for tag in r["tag_counts"]})
-    header = "Ideology".ljust(18) + "".join(t[:20].ljust(22) for t in all_tags)
-    print(header)
-    for ideology, r in results.items():
-        if r is None:
-            continue
-        row = ideology.ljust(18)
-        row += "".join(str(r["tag_counts"].get(t, 0)).ljust(22) for t in all_tags)
-        print(row)
+    skill_check_stats(data, prepared)               
+    return results, prepared
 
-    return results
+
+def passive_by_skill(data, prepared, top=6):
+    actor_by_id = {
+        a["id"]: next((f["value"] for f in a.get("fields", []) if f["title"] == "Name"), "?")
+        for a in data.get("actors", [])
+    }
+    conv_by_id = {c["id"]: c for c in data["conversations"]}
+    for ideology, p in prepared.items():
+        by_skill = Counter()
+        for cid in p["conv_ids"]:
+            for e in conv_by_id[cid]["dialogueEntries"]:
+                f = {x["title"]: x["value"] for x in e.get("fields", [])}
+                if str(f.get("DifficultyPass", "0")) not in ("", "0"):
+                    try:
+                        by_skill[actor_by_id.get(int(f.get("Actor")), "?")] += 1
+                    except (TypeError, ValueError):
+                        by_skill["?"] += 1
+        print(f"\n{ideology}: {by_skill.most_common(top)}")
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    data = load_game_data(DATA_FILE_PATH)
+    results, prepared = run_pipeline(data)
+    passive_by_skill(data, prepared)
+
+conv_by_id = {c["id"]: c for c in data["conversations"]}
+samples = {"2": [], "10": [], "0": []}
+for cid in prepared["Moralism"]["conv_ids"]:
+    for e in conv_by_id[cid]["dialogueEntries"]:
+        f = {x["title"]: x["value"] for x in e.get("fields", [])}
+        v = str(f.get("DifficultyPass", ""))
+        if v in samples and len(samples[v]) < 6:
+            samples[v].append((cid, e["id"], f.get("Actor"), (f.get("Dialogue Text") or "")[:70],
+                               (e.get("conditionsString") or "")[:60]))
+for v, rows in samples.items():
+    print(f"\nDifficultyPass = {v}")
+    for r in rows:
+        print("  ", r)
+    
+
+def passive_by_skill(data, prepared, top=5):
+    actor_by_id = {
+        a["id"]: next((f["value"] for f in a.get("fields", []) if f["title"] == "Name"), "?")
+        for a in data.get("actors", [])
+    }
+    conv_by_id = {c["id"]: c for c in data["conversations"]}
+    for ideology, p in prepared.items():
+        by_skill = Counter()
+        for cid in p["conv_ids"]:
+            for e in conv_by_id[cid]["dialogueEntries"]:
+                f = {x["title"]: x["value"] for x in e.get("fields", [])}
+                if str(f.get("DifficultyPass", "0")) not in ("", "0"):
+                    try:
+                        by_skill[actor_by_id.get(int(f.get("Actor")), "?")] += 1
+                    except (TypeError, ValueError):
+                        by_skill["?"] += 1
+        print(f"\n{ideology}: {by_skill.most_common(top)}")
